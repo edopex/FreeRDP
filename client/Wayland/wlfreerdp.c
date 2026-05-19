@@ -174,12 +174,169 @@ static BOOL wl_resize_display(rdpContext* context)
 	return wl_refresh_display(wlc);
 }
 
+static BOOL wlf_detect_monitors(wlfContext* context, UINT32* pMaxWidth, UINT32* pMaxHeight)
+{
+	rdpSettings* settings = context->common.context.settings;
+	uint32_t nmonitors = UwacDisplayGetNbOutputs(context->display);
+
+	if (nmonitors == 0)
+	{
+		*pMaxWidth = 1024;
+		*pMaxHeight = 768;
+		return TRUE;
+	}
+
+	rdpMonitor* rdpmonitors = calloc(nmonitors, sizeof(rdpMonitor));
+	if (!rdpmonitors)
+		return FALSE;
+
+	size_t active_count = 0;
+	BOOL use_multimon = freerdp_settings_get_bool(settings, FreeRDP_UseMultimon);
+
+	if (use_multimon)
+	{
+		for (uint32_t i = 0; i < nmonitors; i++)
+		{
+			const UwacOutput* output = UwacDisplayGetOutput(context->display, (int)i);
+			if (!output)
+				continue;
+
+			UwacSize resolution;
+			UwacPosition pos;
+			if (UwacOutputGetPosition(output, &pos) != UWAC_SUCCESS)
+				continue;
+			if (UwacOutputGetResolution(output, &resolution) != UWAC_SUCCESS)
+				continue;
+
+			rdpMonitor* monitor = &rdpmonitors[active_count];
+			monitor->x = pos.x;
+			monitor->y = pos.y;
+			monitor->width = resolution.width;
+			monitor->height = resolution.height;
+			monitor->orig_screen = (int)i;
+			monitor->is_primary = (i == 0);
+
+			active_count++;
+		}
+	}
+	else
+	{
+		const UwacOutput* output = UwacDisplayGetOutput(context->display, 0);
+		if (output)
+		{
+			UwacSize resolution;
+			UwacPosition pos;
+			if (UwacOutputGetPosition(output, &pos) == UWAC_SUCCESS &&
+			    UwacOutputGetResolution(output, &resolution) == UWAC_SUCCESS)
+			{
+				rdpMonitor* monitor = &rdpmonitors[0];
+				monitor->x = 0;
+				monitor->y = 0;
+				monitor->width = resolution.width;
+				monitor->height = resolution.height;
+				monitor->orig_screen = 0;
+				monitor->is_primary = TRUE;
+				active_count = 1;
+			}
+		}
+	}
+
+	if (active_count == 0)
+	{
+		free(rdpmonitors);
+		return FALSE;
+	}
+
+	BOOL overlap = FALSE;
+	for (size_t i = 0; i < active_count; i++)
+	{
+		for (size_t j = i + 1; j < active_count; j++)
+		{
+			if (rdpmonitors[i].x == rdpmonitors[j].x && rdpmonitors[i].y == rdpmonitors[j].y)
+			{
+				overlap = TRUE;
+				break;
+			}
+		}
+		if (overlap)
+			break;
+	}
+
+	if (overlap)
+	{
+		int32_t current_x = 0;
+		for (size_t i = 0; i < active_count; i++)
+		{
+			rdpmonitors[i].x = current_x;
+			rdpmonitors[i].y = 0;
+			current_x += rdpmonitors[i].width;
+		}
+	}
+
+	int32_t left = rdpmonitors[0].x;
+	int32_t top = rdpmonitors[0].y;
+	int32_t right = rdpmonitors[0].x + rdpmonitors[0].width;
+	int32_t bottom = rdpmonitors[0].y + rdpmonitors[0].height;
+
+	for (size_t i = 1; i < active_count; i++)
+	{
+		if (rdpmonitors[i].x < left)
+			left = rdpmonitors[i].x;
+		if (rdpmonitors[i].y < top)
+			top = rdpmonitors[i].y;
+		if (rdpmonitors[i].x + rdpmonitors[i].width > right)
+			right = rdpmonitors[i].x + rdpmonitors[i].width;
+		if (rdpmonitors[i].y + rdpmonitors[i].height > bottom)
+			bottom = rdpmonitors[i].y + rdpmonitors[i].height;
+	}
+
+	for (size_t i = 0; i < active_count; i++)
+	{
+		rdpmonitors[i].x -= left;
+		rdpmonitors[i].y -= top;
+	}
+
+	BOOL has_primary = FALSE;
+	for (size_t i = 0; i < active_count; i++)
+	{
+		if (rdpmonitors[i].is_primary)
+		{
+			has_primary = TRUE;
+			break;
+		}
+	}
+	if (!has_primary)
+	{
+		rdpmonitors[0].is_primary = TRUE;
+	}
+
+	*pMaxWidth = (UINT32)(right - left);
+	*pMaxHeight = (UINT32)(bottom - top);
+
+	if (!freerdp_settings_set_uint32(settings, FreeRDP_MonitorCount, (UINT32)active_count))
+	{
+		free(rdpmonitors);
+		return FALSE;
+	}
+
+	if (active_count > 1)
+	{
+		if (!freerdp_settings_set_bool(settings, FreeRDP_SupportMonitorLayoutPdu, TRUE))
+		{
+			free(rdpmonitors);
+			return FALSE;
+		}
+	}
+
+	BOOL rc = freerdp_settings_set_monitor_def_array_sorted(settings, rdpmonitors, active_count);
+	free(rdpmonitors);
+	return rc;
+}
+
 static BOOL wl_pre_connect(freerdp* instance)
 {
 	rdpSettings* settings = nullptr;
 	wlfContext* context = nullptr;
-	const UwacOutput* output = nullptr;
-	UwacSize resolution;
 
 	if (!instance)
 		return FALSE;
@@ -204,24 +361,18 @@ static BOOL wl_pre_connect(freerdp* instance)
 	                                        wlf_OnChannelDisconnectedEventHandler) < 0)
 		return FALSE;
 
-	if (freerdp_settings_get_bool(settings, FreeRDP_Fullscreen))
+	if (freerdp_settings_get_bool(settings, FreeRDP_Fullscreen) ||
+	    freerdp_settings_get_bool(settings, FreeRDP_UseMultimon))
 	{
-		// Use the resolution of the first display output
-		output = UwacDisplayGetOutput(context->display, 0);
+		UINT32 width = 0;
+		UINT32 height = 0;
+		if (!wlf_detect_monitors(context, &width, &height))
+			return FALSE;
 
-		if ((output != nullptr) && (UwacOutputGetResolution(output, &resolution) == UWAC_SUCCESS))
-		{
-			if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth,
-			                                 (UINT32)resolution.width))
-				return FALSE;
-			if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight,
-			                                 (UINT32)resolution.height))
-				return FALSE;
-		}
-		else
-		{
-			WLog_WARN(TAG, "Failed to get output resolution! Check your display settings");
-		}
+		if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, width))
+			return FALSE;
+		if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, height))
+			return FALSE;
 	}
 
 	return TRUE;
