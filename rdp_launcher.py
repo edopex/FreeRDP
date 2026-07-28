@@ -460,6 +460,11 @@ class RDPLauncherApp:
             cmd.append("/microphone:sys:alsa")
         if self.val_camera.get():
             cmd.append("/dvc:rdpecam")
+        if self.val_audio.get() or self.val_microphone.get() or self.val_camera.get():
+            cmd.append("/log-filters:com.freerdp.channels.rdpsnd:DEBUG,"
+                       "com.freerdp.channels.audin:DEBUG,"
+                       "com.freerdp.channels.rdpecam:DEBUG,"
+                       "com.freerdp.channels.drdynvc:DEBUG")
 
         # Launch asynchronously so GUI doesn't hang
         try:
