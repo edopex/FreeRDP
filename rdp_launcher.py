@@ -1,597 +1,1195 @@
 #!/usr/bin/env python3
-import os
-import sys
-import json
+"""
+FreeRDP Launcher — GTK4/libadwaita front-end for the custom sdl-freerdp build:
+connection profiles, a clickable preview of the local monitors to choose which
+ones the session spans, and colours that follow the active Omarchy theme.
+
+Requires: python-gobject, libadwaita (GTK4)
+"""
+
 import base64
+import json
+import os
+import re
+import shutil
 import subprocess
-import tkinter as tk
-from tkinter import messagebox
+import sys
+import threading
+import tomllib
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
 
-# Theme Colors
-BG_COLOR = "#0F172A"       # Slate 900
-SIDEBAR_BG = "#1E293B"    # Slate 800
-CARD_BG = "#334155"       # Slate 700
-ACCENT_COLOR = "#3B82F6"  # Blue 500
-ACCENT_HOVER = "#2563EB"  # Blue 600
-TEXT_COLOR = "#F8FAFC"    # Slate 50
-TEXT_MUTED = "#94A3B8"    # Slate 400
-ERROR_COLOR = "#EF4444"   # Red 500
-ERROR_HOVER = "#DC2626"   # Red 600
-SUCCESS_COLOR = "#10B981" # Emerald 500
-SUCCESS_HOVER = "#059669" # Emerald 600
+try:
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    gi.require_version("PangoCairo", "1.0")
+    from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango, PangoCairo
+except (ImportError, ValueError) as e:
+    print(f"Error: missing dependency ({e}).\n"
+          "Install with: sudo pacman -S python-gobject libadwaita", file=sys.stderr)
+    sys.exit(1)
 
-CONFIG_DIR = os.path.expanduser("~/.config/freerdp")
-PROFILES_FILE = os.path.join(CONFIG_DIR, "profiles.json")
-DEFAULT_BINARY = "/home/edopex/.gemini/antigravity/scratch/FreeRDP/build/client/SDL/SDL3/sdl-freerdp"
+APP_ID = "dev.edopex.RdpLauncher"
+VERSION = "2.0"
+
+CONFIG_DIR = Path.home() / ".config/freerdp"
+PROFILES_FILE = CONFIG_DIR / "profiles.json"
+LOG_FILE = CONFIG_DIR / "last_connection.log"
+DEFAULT_BINARY = "/home/edopex/Projects/FreeRDP/build/client/SDL/SDL3/sdl-freerdp"
 FALLBACK_BINARY = "/usr/bin/sdl-freerdp3"
+BIN_LINK = Path.home() / ".local/bin/rdp-launcher"
+DESKTOP_FILE = Path.home() / ".local/share/applications/freerdp-launcher.desktop"
 
-def obfuscate_password(password):
+THEME_POLL_SECONDS = 2
+STARTUP_GRACE_MS = 3000        # an exit before this counts as a failed connection
+
+DEFAULTS = {
+    "host": "", "port": "3389", "user": "", "pass": "", "domain": "",
+    "multimon": True, "fullscreen": True, "dyn_res": True,
+    "audio": True, "microphone": False, "camera": False, "clipboard": True,
+    "gfx": False, "ignore_cert": True, "security": "auto",
+    # Output names (e.g. "HDMI-A-1") left out of /multimon. None = default:
+    # the HDMI TV, which stays "enabled" with DPMS off, so FreeRDP sees it.
+    "excluded_monitors": None,
+}
+
+# "auto" lets FreeRDP negotiate (NLA/TLS/RDP). Some servers reject the
+# negotiation with SSL_NOT_ALLOWED_BY_SERVER and need the level forced.
+SECURITY = [("auto", "Automática"), ("nla", "NLA"), ("tls", "TLS"), ("rdp", "RDP")]
+
+FRIENDLY_ERRORS = {
+    "ERRCONNECT_CONNECT_FAILED": "No se pudo llegar al servidor. Revisa el host, el puerto y la red.",
+    "ERRCONNECT_DNS_NAME_NOT_FOUND": "No se encontró el nombre del host.",
+    "ERRCONNECT_LOGON_FAILURE": "Usuario o contraseña incorrectos.",
+    "ERRCONNECT_AUTHENTICATION_FAILED": "Falló la autenticación: revisa usuario, contraseña y dominio.",
+    "ERRCONNECT_PASSWORD_EXPIRED": "La contraseña expiró.",
+    "ERRCONNECT_ACCOUNT_LOCKED_OUT": "La cuenta está bloqueada.",
+    "ERRCONNECT_TLS_CONNECT_FAILED": "Falló la conexión TLS. Prueba otro nivel de seguridad.",
+    "SSL_NOT_ALLOWED_BY_SERVER": "El servidor no acepta TLS: prueba Seguridad → RDP.",
+    "HYBRID_REQUIRED_BY_SERVER": "El servidor exige NLA: prueba Seguridad → NLA.",
+    "ERRCONNECT_CONNECT_CANCELLED": "La conexión se canceló.",
+}
+
+
+# ── Profiles ─────────────────────────────────────────────────────────────
+def obfuscate_password(password: str) -> str:
     if not password:
         return ""
-    try:
-        encoded = base64.b64encode(password.encode("utf-8")).decode("utf-8")
-        return f"b64:{encoded}"
-    except Exception:
-        return password
+    return "b64:" + base64.b64encode(password.encode()).decode()
 
-def deobfuscate_password(obfuscated):
-    if not obfuscated:
+
+def deobfuscate_password(value: str) -> str:
+    if value and value.startswith("b64:"):
+        try:
+            return base64.b64decode(value[4:].encode(), validate=True).decode()
+        except (ValueError, UnicodeDecodeError):
+            return value
+    return value or ""
+
+
+def load_profiles() -> dict[str, dict]:
+    try:
+        data = json.loads(PROFILES_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    profiles = {}
+    for name, entry in data.items():
+        profile = {**DEFAULTS, **entry}
+        profile["pass"] = deobfuscate_password(profile.get("pass", ""))
+        profiles[name] = profile
+    return profiles
+
+
+def save_profiles(profiles: dict[str, dict]) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    data = {name: {**p, "pass": obfuscate_password(p.get("pass", ""))}
+            for name, p in profiles.items()}
+    tmp = PROFILES_FILE.with_name(f".{PROFILES_FILE.name}.tmp")
+    tmp.write_text(json.dumps(data, indent=4))
+    tmp.replace(PROFILES_FILE)
+
+
+# ── Monitors ─────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class Monitor:
+    name: str           # output name, e.g. "DP-1"
+    description: str
+    width: int          # pixels, rotation applied
+    height: int
+    x: float            # logical layout position
+    y: float
+    scale: float = 1.0
+
+    @property
+    def logical(self) -> tuple[float, float]:
+        return self.width / self.scale, self.height / self.scale
+
+    @property
+    def is_tv(self) -> bool:
+        return "hdmi" in self.name.lower()
+
+
+def detect_monitors() -> list[Monitor]:
+    """Local layout from Hyprland (instant, no windows flashing on screen)."""
+    try:
+        out = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True,
+                             text=True, timeout=3, check=True).stdout
+        data = json.loads(out)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+    monitors = []
+    for d in data:
+        if d.get("disabled") or d.get("mirrorOf", "none") not in ("none", "", None):
+            continue
+        w, h = int(d["width"]), int(d["height"])
+        if int(d.get("transform", 0)) % 2 == 1:      # 90°/270°: portrait
+            w, h = h, w
+        monitors.append(Monitor(d["name"], d.get("description", ""), w, h,
+                                float(d.get("x", 0)), float(d.get("y", 0)),
+                                float(d.get("scale", 1.0)) or 1.0))
+    return sorted(monitors, key=lambda m: (m.x, m.y))
+
+
+_SDL_MONITOR = re.compile(r"\[(\d+)\]\s*\[([^\]]*)\]")
+
+
+def sdl_monitor_ids(binary: str) -> dict[str, int]:
+    """Output name → SDL display ID, as `/monitors:` expects (IDs change on hotplug)."""
+    try:
+        out = subprocess.run([binary, "/list:monitor"], capture_output=True,
+                             text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    ids = {}
+    for match in _SDL_MONITOR.finditer(out.stdout + out.stderr):
+        names = re.findall(r"\(([^()]+)\)", match.group(2))
+        if names:
+            ids[names[-1]] = int(match.group(1))
+    return ids
+
+
+def layout_bbox(monitors: list[Monitor]) -> tuple[float, float, float, float]:
+    min_x = min(m.x for m in monitors)
+    min_y = min(m.y for m in monitors)
+    max_x = max(m.x + m.logical[0] for m in monitors)
+    max_y = max(m.y + m.logical[1] for m in monitors)
+    return min_x, min_y, max_x - min_x, max_y - min_y
+
+
+def touches(a: Monitor, b: Monitor) -> bool:
+    """Share an edge (not just a corner), so the pointer can cross."""
+    (aw, ah), (bw, bh) = a.logical, b.logical
+    side = (a.x + aw == b.x or b.x + bw == a.x) and a.y < b.y + bh and b.y < a.y + ah
+    stack = (a.y + ah == b.y or b.y + bh == a.y) and a.x < b.x + bw and b.x < a.x + aw
+    return side or stack
+
+
+def primary_of(monitors: list[Monitor]) -> Monitor | None:
+    """The monitor at the origin: FreeRDP makes it the session's main screen."""
+    return next((m for m in monitors if m.x == 0 and m.y == 0),
+                monitors[0] if monitors else None)
+
+
+def find_binary() -> str | None:
+    for path in (DEFAULT_BINARY, FALLBACK_BINARY):
+        if os.access(path, os.X_OK):
+            return path
+    return shutil.which("sdl-freerdp3") or shutil.which("sdl-freerdp")
+
+
+# ── Omarchy theme ────────────────────────────────────────────────────────
+COLORS_FILE = Path.home() / ".config/omarchy/current/theme/colors.toml"
+_FALLBACK_COLORS = {"background": "#0f172a", "foreground": "#e2e8f0", "accent": "#3b82f6",
+                    "color1": "#ef4444", "color2": "#10b981", "color3": "#f59e0b"}
+
+
+def _rgb(hex_color: str) -> tuple[int, int, int]:
+    h = hex_color.lstrip("#")[:6]
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _mix(a: str, b: str, t: float) -> str:
+    return "#" + "".join(f"{max(0, min(255, round(x + (y - x) * t))):02x}"
+                         for x, y in zip(_rgb(a), _rgb(b)))
+
+
+def _luminance(hex_color: str) -> float:
+    r, g, b = (c / 255 for c in _rgb(hex_color))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def load_colors() -> dict[str, str]:
+    try:
+        data = tomllib.loads(COLORS_FILE.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        data = {}
+    return {**_FALLBACK_COLORS, **{k: v for k, v in data.items() if isinstance(v, str)}}
+
+
+def theme_signature() -> str:
+    try:
+        return COLORS_FILE.read_text()
+    except OSError:
         return ""
-    if obfuscated.startswith("b64:"):
+
+
+def is_dark(colors: dict[str, str]) -> bool:
+    return _luminance(colors["background"]) < 0.5
+
+
+def on_color(colors: dict[str, str], bg: str) -> str:
+    return colors["background"] if _luminance(bg) > 0.5 else "#ffffff"
+
+
+def theme_css(colors: dict[str, str]) -> str:
+    bg, fg, accent = colors["background"], colors["foreground"], colors["accent"]
+    red, green, yellow = colors["color1"], colors["color2"], colors["color3"]
+    tokens = {
+        "accent-bg-color": accent,
+        "accent-fg-color": on_color(colors, accent),
+        "accent-color": _mix(accent, fg, 0.15) if is_dark(colors) else _mix(accent, bg, 0.2),
+        "destructive-bg-color": red,
+        "destructive-fg-color": on_color(colors, red),
+        "destructive-color": red,
+        "success-color": green,
+        "warning-color": yellow,
+        "error-color": red,
+        "window-bg-color": bg,
+        "window-fg-color": fg,
+        "view-bg-color": _mix(bg, fg, 0.03),
+        "view-fg-color": fg,
+        "headerbar-bg-color": _mix(bg, fg, 0.05),
+        "headerbar-fg-color": fg,
+        "headerbar-backdrop-color": bg,
+        "sidebar-bg-color": _mix(bg, fg, 0.05),
+        "sidebar-fg-color": fg,
+        "card-bg-color": _mix(bg, fg, 0.07),
+        "card-fg-color": fg,
+        "popover-bg-color": _mix(bg, fg, 0.08),
+        "popover-fg-color": fg,
+        "dialog-bg-color": _mix(bg, fg, 0.06),
+        "dialog-fg-color": fg,
+    }
+    body = "\n".join(f"  --{k}: {v};" for k, v in tokens.items())
+    return f":root {{\n{body}\n}}\n"
+
+
+STYLE = """
+.layout-stage {
+  border-radius: 16px;
+  background-color: color-mix(in srgb, var(--window-bg-color) 55%, black);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--window-fg-color) 8%, transparent);
+}
+.connect-button {
+  padding: 8px 32px;
+  font-weight: 700;
+}
+.log-view {
+  border-radius: 12px;
+  padding: 10px;
+  background-color: color-mix(in srgb, var(--window-bg-color) 70%, black);
+}
+.status-ok { color: var(--success-color); }
+.status-error { color: var(--error-color); }
+"""
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────
+def run_async(fn, on_done=None, on_error=None):
+    """Run `fn()` off the main loop; deliver the result/exception back on it."""
+    def deliver(cb, value):
+        cb(value)
+        return GLib.SOURCE_REMOVE
+
+    def worker():
         try:
-            decoded_bytes = base64.b64decode(obfuscated[4:].encode("utf-8"), validate=True)
-            return decoded_bytes.decode("utf-8")
-        except Exception:
-            return obfuscated
-    return obfuscated
+            result = fn()
+        except Exception as e:  # noqa: BLE001 — reported to the UI
+            if on_error:
+                GLib.idle_add(deliver, on_error, e)
+            else:
+                traceback.print_exc()
+            return
+        if on_done:
+            GLib.idle_add(deliver, on_done, result)
 
-def load_profiles():
-    if not os.path.exists(CONFIG_DIR):
-        os.makedirs(CONFIG_DIR)
-    if os.path.exists(PROFILES_FILE):
-        try:
-            with open(PROFILES_FILE, "r") as f:
-                profiles = json.load(f)
-                for name, data in profiles.items():
-                    if "pass" in data:
-                        data["pass"] = deobfuscate_password(data["pass"])
-                return profiles
-        except Exception:
-            pass
-    return {}
+    threading.Thread(target=worker, daemon=True).start()
 
-def save_profiles(profiles):
-    profiles_to_save = {}
-    for name, data in profiles.items():
-        profiles_to_save[name] = data.copy()
-        if "pass" in profiles_to_save[name]:
-            profiles_to_save[name]["pass"] = obfuscate_password(profiles_to_save[name]["pass"])
-    try:
-        with open(PROFILES_FILE, "w") as f:
-            json.dump(profiles_to_save, f, indent=4)
-    except Exception as e:
-        messagebox.showerror("Error", f"No se pudieron guardar los perfiles: {e}")
 
-class RDPLauncherApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("FreeRDP Connection Manager")
-        self.root.geometry("850x550")
-        self.root.configure(bg=BG_COLOR)
-        
+def summarize_error(log: str) -> str:
+    codes = "|".join(re.escape(k) for k in FRIENDLY_ERRORS)
+    for line in reversed(log.splitlines()):
+        match = re.search(codes, line)
+        if match:
+            return FRIENDLY_ERRORS[match.group(0)]
+    return ""
+
+
+def _rounded_rect(cr, x, y, w, h, r):
+    r = min(r, w / 2, h / 2)
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -1.5708, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, 1.5708)
+    cr.arc(x + r, y + h - r, r, 1.5708, 3.1416)
+    cr.arc(x + r, y + r, r, 3.1416, 4.7124)
+    cr.close_path()
+
+
+# ── Monitor layout preview ───────────────────────────────────────────────
+class MonitorLayout(Gtk.DrawingArea):
+    """The local monitors to scale; clicking one includes/excludes it."""
+
+    PAD = 20
+    GAP = 3
+
+    def __init__(self, on_toggle):
+        super().__init__(content_height=260, hexpand=True)
+        self.on_toggle = on_toggle
+        self.monitors: list[Monitor] = []
+        self.excluded: set[str] = set()
+        self.single = False
+        self.colors = load_colors()
+        self.hover: str | None = None
+        self.set_draw_func(self._draw)
+
+        click = Gtk.GestureClick()
+        click.connect("released", self._clicked)
+        self.add_controller(click)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", lambda _c, x, y: self._set_hover(self._monitor_at(x, y)))
+        motion.connect("leave", lambda *_: self._set_hover(None))
+        self.add_controller(motion)
+
+    def update(self, monitors, excluded, single) -> None:
+        self.monitors, self.excluded, self.single = monitors, set(excluded), single
+        self.queue_draw()
+
+    def set_colors(self, colors) -> None:
+        self.colors = colors
+        self.queue_draw()
+
+    def is_used(self, m: Monitor) -> bool:
+        if self.single:
+            return m is primary_of(self.monitors)
+        return m.name not in self.excluded
+
+    def _rects(self) -> dict[str, tuple[float, float, float, float]]:
+        if not self.monitors:
+            return {}
+        width, height = self.get_width(), self.get_height()
+        min_x, min_y, bw, bh = layout_bbox(self.monitors)
+        k = min((width - 2 * self.PAD) / bw, (height - 2 * self.PAD) / bh)
+        ox = (width - bw * k) / 2 - min_x * k
+        oy = (height - bh * k) / 2 - min_y * k
+        return {m.name: (ox + m.x * k, oy + m.y * k, m.logical[0] * k, m.logical[1] * k)
+                for m in self.monitors}
+
+    def _monitor_at(self, px, py) -> str | None:
+        for name, (x, y, w, h) in self._rects().items():
+            if x <= px <= x + w and y <= py <= y + h:
+                return name
+        return None
+
+    def _set_hover(self, name) -> None:
+        if self.single:
+            name = None
+        if name != self.hover:
+            self.hover = name
+            self.set_cursor_from_name("pointer" if name else None)
+            self.queue_draw()
+
+    def _clicked(self, _gesture, _n, x, y) -> None:
+        name = self._monitor_at(x, y)
+        if name and not self.single:
+            self.on_toggle(name)
+
+    def _draw(self, _area, cr, width, height) -> None:
+        fg = [c / 255 for c in _rgb(self.colors["foreground"])]
+        accent_hex = self.colors["accent"]
+        accent = [c / 255 for c in _rgb(accent_hex)]
+        on_accent = [c / 255 for c in _rgb(on_color(self.colors, accent_hex))]
+        rects = self._rects()
+
+        if not rects:
+            layout = self.create_pango_layout("No se detectaron monitores locales")
+            tw, th = layout.get_pixel_size()
+            cr.set_source_rgba(*fg, 0.5)
+            cr.move_to((width - tw) / 2, (height - th) / 2)
+            PangoCairo.show_layout(cr, layout)
+            return
+
+        primary = primary_of(self.monitors)
+        for m in self.monitors:
+            x, y, w, h = rects[m.name]
+            x, y, w, h = x + self.GAP, y + self.GAP, w - 2 * self.GAP, h - 2 * self.GAP
+            used = self.is_used(m)
+            hovered = m.name == self.hover
+
+            _rounded_rect(cr, x, y, w, h, 10)
+            if used:
+                cr.set_source_rgba(*accent, 1.0 if hovered else 0.85)
+                cr.fill()
+            else:
+                cr.set_source_rgba(*fg, 0.10 if hovered else 0.05)
+                cr.fill_preserve()
+                cr.set_source_rgba(*fg, 0.35)
+                cr.set_line_width(1.5)
+                cr.set_dash([6, 4])
+                cr.stroke()
+                cr.set_dash([])
+
+            lines = [f"<b>{GLib.markup_escape_text(m.name)}</b>", f"{m.width}×{m.height}"]
+            if m is primary:
+                lines.append("principal")
+            elif not used:
+                lines.append("excluido")
+            layout = self.create_pango_layout(None)
+            layout.set_alignment(Pango.Alignment.CENTER)
+            layout.set_width(int(max(w - 12, 1) * Pango.SCALE))
+            layout.set_ellipsize(Pango.EllipsizeMode.END)
+            layout.set_markup("\n".join(lines), -1)
+            # Narrow (portrait) or small monitors: fewer lines rather than "108…"
+            while len(lines) > 1 and (layout.is_ellipsized() or layout.get_pixel_size()[1] > h - 8):
+                lines.pop()
+                layout.set_markup("\n".join(lines), -1)
+            tw, th = layout.get_pixel_size()
+            if used:
+                cr.set_source_rgb(*on_accent)
+            else:
+                cr.set_source_rgba(*fg, 0.6)
+            cr.move_to(x + (w - layout.get_width() / Pango.SCALE) / 2, y + (h - th) / 2)
+            PangoCairo.show_layout(cr, layout)
+
+
+# ── Main window ──────────────────────────────────────────────────────────
+class LauncherWindow(Adw.ApplicationWindow):
+    def __init__(self, app: Adw.Application):
+        super().__init__(application=app, title="FreeRDP", default_width=1040,
+                         default_height=780)
+        self.set_size_request(380, 480)
         self.profiles = load_profiles()
-        self.current_profile_name = None
-        self.show_password = False
+        self.current: str | None = None      # saved name of the profile on screen
+        self.monitors: list[Monitor] = []
+        self.excluded: set[str] | None = None
+        self._loading = False
+        self._dirty = False
+        self._rows: dict[str, Adw.ActionRow] = {}
 
-        # Left Sidebar (Profiles list)
-        self.sidebar = tk.Frame(self.root, bg=SIDEBAR_BG, width=250)
-        self.sidebar.pack(side=tk.LEFT, fill=tk.Y)
-        self.sidebar.pack_propagate(False)
+        # Sidebar: profiles
+        self.listbox = Gtk.ListBox(css_classes=["navigation-sidebar"])
+        self.listbox.set_placeholder(Gtk.Label(label="Sin perfiles guardados",
+                                               css_classes=["dim-label"], margin_top=24))
+        self.listbox.connect("row-selected", self._on_row_selected)
+        side_header = Adw.HeaderBar()
+        side_header.pack_start(Gtk.Button(icon_name="list-add-symbolic",
+                                          action_name="win.new-profile",
+                                          tooltip_text="Nuevo perfil (Ctrl+N)"))
+        sidebar = Adw.ToolbarView(content=Gtk.ScrolledWindow(
+            child=self.listbox, hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True))
+        sidebar.add_top_bar(side_header)
 
-        # Main Panel (Form)
-        self.main_panel = tk.Frame(self.root, bg=BG_COLOR, padx=30, pady=25)
-        self.main_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        # Content: form
+        self.title = Adw.WindowTitle()
+        header = Adw.HeaderBar(title_widget=self.title)
+        self.save_button = Gtk.Button(icon_name="document-save-symbolic",
+                                      action_name="win.save", tooltip_text="Guardar (Ctrl+S)")
+        menu = Gio.Menu()
+        profile_section = Gio.Menu()
+        profile_section.append("Duplicar perfil", "win.duplicate")
+        profile_section.append("Eliminar perfil", "win.delete")
+        menu.append_section(None, profile_section)
+        tools = Gio.Menu()
+        tools.append("Ver log de la última conexión", "win.show-log")
+        tools.append("Crear acceso en el menú de apps", "win.install-shortcut")
+        menu.append_section(None, tools)
+        app_section = Gio.Menu()
+        app_section.append("Atajos de teclado", "app.shortcuts")
+        app_section.append("Acerca de FreeRDP Launcher", "app.about")
+        menu.append_section(None, app_section)
+        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu,
+                                       primary=True, tooltip_text="Menú principal"))
+        header.pack_end(self.save_button)
 
-        self.setup_sidebar()
-        self.setup_main_panel()
-        
-        # Load first profile if exists
+        page = Adw.PreferencesPage()
+        page.add(self._connection_group())
+        page.add(self._display_group())
+        page.add(self._display_options_group())
+        page.add(self._redirection_group())
+        page.add(self._advanced_group())
+
+        self.status = Gtk.Label(css_classes=["dim-label"], ellipsize=Pango.EllipsizeMode.END,
+                                xalign=0, hexpand=True)
+        self.spinner = Adw.Spinner(visible=False)
+        self.connect_button = Gtk.Button(
+            child=Adw.ButtonContent(icon_name="media-playback-start-symbolic", label="Conectar"),
+            action_name="win.connect", tooltip_text="Conectar (Ctrl+Enter)",
+            css_classes=["suggested-action", "pill", "connect-button"])
+        bottom = Gtk.ActionBar()
+        status_box = Gtk.Box(spacing=8, margin_start=6)
+        status_box.append(self.spinner)
+        status_box.append(self.status)
+        bottom.pack_start(status_box)
+        bottom.pack_end(self.connect_button)
+
+        content = Adw.ToolbarView(content=page)
+        content.add_top_bar(header)
+        content.add_bottom_bar(bottom)
+
+        self.split = Adw.NavigationSplitView(
+            sidebar=Adw.NavigationPage(child=sidebar, title="Perfiles"),
+            content=Adw.NavigationPage(child=content, title="Conexión"),
+            min_sidebar_width=220, max_sidebar_width=300)
+        self.toasts = Adw.ToastOverlay(child=self.split)
+        self.set_content(self.toasts)
+
+        bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 720sp"))
+        bp.add_setter(self.split, "collapsed", True)
+        self.add_breakpoint(bp)
+
+        self._install_actions()
+        self._render_list()
         if self.profiles:
-            first_name = list(self.profiles.keys())[0]
-            self.select_profile(first_name)
+            self._select(next(iter(self.profiles)))
+        else:
+            self.new_profile()
+        self.refresh_monitors()
+
+    # ── Form ─────────────────────────────────────────────────────────────
+    def _entry(self, group, key, title, cls=Adw.EntryRow, **props):
+        row = cls(title=title, **props)
+        row.connect("changed", self._changed)
+        group.add(row)
+        self.entries[key] = row
+        return row
+
+    def _switch(self, group, key, title, subtitle=""):
+        row = Adw.SwitchRow(title=title, subtitle=subtitle)
+        row.connect("notify::active", self._changed)
+        group.add(row)
+        self.switches[key] = row
+        return row
+
+    def _connection_group(self):
+        self.entries: dict[str, Adw.EntryRow] = {}
+        self.switches: dict[str, Adw.SwitchRow] = {}
+        group = Adw.PreferencesGroup(title="Conexión")
+        self._entry(group, "name", "Nombre del perfil")
+        self._entry(group, "host", "Host o IP")
+        self._entry(group, "port", "Puerto", input_purpose=Gtk.InputPurpose.DIGITS)
+        self._entry(group, "user", "Usuario")
+        self._entry(group, "pass", "Contraseña", cls=Adw.PasswordEntryRow)
+        self._entry(group, "domain", "Dominio (opcional)")
+        self.entries["host"].connect("changed", lambda *_: self._update_title())
+        self.entries["name"].connect("changed", lambda *_: self._update_title())
+        return group
+
+    def _display_group(self):
+        group = Adw.PreferencesGroup(
+            title="Monitores",
+            description="Haz clic en un monitor para incluirlo o sacarlo de la sesión.")
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic", action_name="win.refresh-monitors",
+                             tooltip_text="Volver a detectar monitores (F5)",
+                             css_classes=["flat"], valign=Gtk.Align.CENTER)
+        group.set_header_suffix(refresh)
+        self.layout = MonitorLayout(self._toggle_monitor)
+        stage = Gtk.Frame(child=self.layout, css_classes=["layout-stage"])
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.append(stage)
+        self.layout_info = Gtk.Label(wrap=True, xalign=0, css_classes=["dim-label"],
+                                     margin_start=4)
+        box.append(self.layout_info)
+        group.add(box)
+        return group
+
+    def _display_options_group(self):
+        group = Adw.PreferencesGroup()
+        self._switch(group, "multimon", "Usar varios monitores",
+                     "Extiende el escritorio de Windows a los monitores marcados")
+        self._switch(group, "fullscreen", "Pantalla completa")
+        self._switch(group, "dyn_res", "Resolución dinámica",
+                     "Ajusta la sesión cuando cambia el tamaño de la ventana")
+        self.switches["multimon"].connect("notify::active", lambda *_: self._update_layout())
+        return group
+
+    def _redirection_group(self):
+        group = Adw.PreferencesGroup(title="Redirección")
+        self._switch(group, "audio", "Sonido")
+        self._switch(group, "microphone", "Micrófono")
+        self._switch(group, "camera", "Cámara")
+        self._switch(group, "clipboard", "Portapapeles")
+        return group
+
+    def _advanced_group(self):
+        group = Adw.PreferencesGroup(title="Avanzado")
+        self.security = Adw.ComboRow(
+            title="Seguridad",
+            subtitle="Si el servidor rechaza la negociación automática, fuerza un nivel",
+            model=Gtk.StringList.new([label for _, label in SECURITY]))
+        self.security.connect("notify::selected", self._changed)
+        group.add(self.security)
+        self._switch(group, "gfx", "Gráficos GFX (H.264 AVC444)")
+        self._switch(group, "ignore_cert", "Ignorar certificados")
+        return group
+
+    def _load_form(self, name: str, data: dict) -> None:
+        self._loading = True
+        data = {**DEFAULTS, **data}
+        self.entries["name"].set_text(name)
+        for key in ("host", "port", "user", "pass", "domain"):
+            self.entries[key].set_text(str(data[key] or ""))
+        for key, row in self.switches.items():
+            row.set_active(bool(data[key]))
+        keys = [k for k, _ in SECURITY]
+        self.security.set_selected(keys.index(data["security"]) if data["security"] in keys else 0)
+        excluded = data["excluded_monitors"]
+        self.excluded = set(excluded) if excluded is not None else None
+        self._loading = False
+        self._set_dirty(False)
+        self._update_layout()
+
+    def _form_data(self) -> dict:
+        data = {key: self.entries[key].get_text().strip() for key in ("host", "port", "user", "domain")}
+        data["pass"] = self.entries["pass"].get_text()
+        data["port"] = data["port"] or "3389"
+        for key, row in self.switches.items():
+            data[key] = row.get_active()
+        data["security"] = SECURITY[self.security.get_selected()][0]
+        data["excluded_monitors"] = sorted(self.excluded) if self.excluded is not None else None
+        return data
+
+    def _changed(self, *_):
+        if not self._loading:
+            self._set_dirty(True)
+
+    def _set_dirty(self, dirty: bool) -> None:
+        self._dirty = dirty
+        if dirty:
+            self.save_button.add_css_class("suggested-action")
+        else:
+            self.save_button.remove_css_class("suggested-action")
+        self._update_title()
+
+    def _update_title(self) -> None:
+        name = self.entries["name"].get_text().strip() or "Nuevo perfil"
+        host = self.entries["host"].get_text().strip()
+        port = self.entries["port"].get_text().strip()
+        subtitle = f"{host}:{port}" if host and port not in ("", "3389") else host
+        if self._dirty:
+            subtitle = f"{subtitle} · sin guardar" if subtitle else "sin guardar"
+        self.title.set_title(name)
+        self.title.set_subtitle(subtitle)
+
+    # ── Monitors ─────────────────────────────────────────────────────────
+    def refresh_monitors(self) -> None:
+        def done(monitors):
+            self.monitors = monitors
+            self._update_layout()
+        run_async(detect_monitors, done, lambda e: self.toast(f"No se detectaron monitores: {e}"))
+
+    def _effective_excluded(self) -> set[str]:
+        if self.excluded is not None:
+            return self.excluded
+        return {m.name for m in self.monitors if m.is_tv}
+
+    def _toggle_monitor(self, name: str) -> None:
+        excluded = set(self._effective_excluded())
+        if name in excluded:
+            excluded.discard(name)
+        else:
+            remaining = [m for m in self.monitors if m.name not in excluded and m.name != name]
+            if not remaining:
+                self.toast("Debe quedar al menos un monitor en la sesión")
+                return
+            excluded.add(name)
+        self.excluded = excluded
+        self._changed()
+        self._update_layout()
+
+    def _update_layout(self) -> None:
+        single = not self.switches["multimon"].get_active()
+        excluded = self._effective_excluded()
+        self.layout.update(self.monitors, excluded, single)
+        self.layout_info.set_label(self._layout_summary(single, excluded))
+
+    def _layout_summary(self, single: bool, excluded: set[str]) -> str:
+        if not self.monitors:
+            return "No se pudo leer la disposición de monitores de Hyprland."
+        if single:
+            p = primary_of(self.monitors)
+            return f"Un solo monitor: {p.name} ({p.width}×{p.height})."
+        used = [m for m in self.monitors if m.name not in excluded]
+        if not used:
+            return "Ningún monitor seleccionado."
+        _, _, w, h = layout_bbox(used)
+        text = (f"{len(used)} {'monitor' if len(used) == 1 else 'monitores'} · "
+                f"escritorio remoto de {round(w)}×{round(h)}")
+        left_out = [m.name for m in self.monitors if m.name in excluded]
+        if left_out:
+            text += f" · sin {', '.join(left_out)}"
+        loose = [m.name for m in used
+                 if len(used) > 1 and not any(touches(m, o) for o in used if o is not m)]
+        if loose:
+            text += f"\n⚠ {', '.join(loose)} no toca a los demás monitores elegidos."
+        return text
+
+    # ── Profiles list ────────────────────────────────────────────────────
+    def _render_list(self) -> None:
+        self._loading = True
+        self.listbox.remove_all()
+        self._rows.clear()
+        for name, data in self.profiles.items():
+            host = data.get("host", "")
+            user = data.get("user", "")
+            row = Adw.ActionRow(title=GLib.markup_escape_text(name), title_lines=1,
+                                subtitle=GLib.markup_escape_text(host), subtitle_lines=1,
+                                tooltip_text=f"{user} en {host}" if user else host)
+            row.add_prefix(Gtk.Image(icon_name="computer-symbolic"))
+            self.listbox.append(row)
+            self._rows[name] = row
+        if self.current in self._rows:
+            self.listbox.select_row(self._rows[self.current])
+        self._loading = False
+
+    def _row_name(self, row) -> str | None:
+        return next((n for n, r in self._rows.items() if r is row), None)
+
+    def _on_row_selected(self, _listbox, row) -> None:
+        if self._loading or row is None:
+            return
+        name = self._row_name(row)
+        if name is None or name == self.current:
+            self.split.set_show_content(True)
+            return
+        if self._dirty:
+            self._confirm_discard(lambda: self._select(name), self._reselect_current)
+        else:
+            self._select(name)
+
+    def _reselect_current(self) -> None:
+        self._loading = True
+        if self.current in self._rows:
+            self.listbox.select_row(self._rows[self.current])
+        else:
+            self.listbox.unselect_all()
+        self._loading = False
+
+    def _select(self, name: str) -> None:
+        self.current = name
+        self._reselect_current()
+        self._load_form(name, self.profiles[name])
+        self.lookup_action("delete").set_enabled(True)
+        self.lookup_action("duplicate").set_enabled(True)
+        self.split.set_show_content(True)
+
+    def _confirm_discard(self, proceed, cancel) -> None:
+        dialog = Adw.AlertDialog(heading="¿Guardar los cambios?",
+                                 body="El perfil tiene cambios sin guardar.")
+        dialog.add_response("cancel", "Cancelar")
+        dialog.add_response("discard", "Descartar")
+        dialog.add_response("save", "Guardar")
+        dialog.set_response_appearance("discard", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("save")
+        dialog.set_close_response("cancel")
+
+        def on_response(_d, response):
+            if response == "save" and self.save_profile():
+                proceed()
+            elif response == "discard":
+                proceed()
+            else:
+                cancel()
+        dialog.connect("response", on_response)
+        dialog.present(self)
+
+    # ── Actions ──────────────────────────────────────────────────────────
+    def _install_actions(self) -> None:
+        for name, callback in (("new-profile", self._new_profile_action),
+                               ("save", self.save_profile),
+                               ("duplicate", self.duplicate_profile),
+                               ("delete", self.confirm_delete),
+                               ("connect", self.connect_rdp),
+                               ("refresh-monitors", self.refresh_monitors),
+                               ("show-log", self.show_log),
+                               ("install-shortcut", self.install_shortcut)):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda *_a, cb=callback: cb())
+            self.add_action(action)
+
+    def toast(self, title: str, timeout: int = 3) -> None:
+        self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(title), timeout=timeout))
+
+    def _new_profile_action(self) -> None:
+        if self._dirty:
+            self._confirm_discard(self.new_profile, lambda: None)
         else:
             self.new_profile()
 
-    def setup_sidebar(self):
-        # Sidebar Header
-        lbl = tk.Label(self.sidebar, text="Perfiles RDP", font=("Arial", 16, "bold"), fg=TEXT_COLOR, bg=SIDEBAR_BG, pady=15)
-        lbl.pack(fill=tk.X)
+    def new_profile(self) -> None:
+        self.current = None
+        self._reselect_current()
+        self._load_form("Nuevo perfil", DEFAULTS)
+        self.lookup_action("delete").set_enabled(False)
+        self.lookup_action("duplicate").set_enabled(False)
+        self.split.set_show_content(True)
+        self.entries["host"].grab_focus()
 
-        # Profiles List Frame
-        self.list_frame = tk.Frame(self.sidebar, bg=SIDEBAR_BG)
-        self.list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        self.profile_buttons = {}
-        self.render_profiles_list()
-
-        # Sidebar Bottom Action Button
-        btn_new = tk.Button(self.sidebar, text="+ Nuevo Perfil", font=("Arial", 11, "bold"), 
-                            fg=TEXT_COLOR, bg=SUCCESS_COLOR, activeforeground=TEXT_COLOR, activebackground=SUCCESS_HOVER,
-                            bd=0, cursor="hand2", pady=10, command=self.new_profile)
-        btn_new.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=15)
-        btn_new.bind("<Enter>", lambda e: btn_new.configure(bg=SUCCESS_HOVER))
-        btn_new.bind("<Leave>", lambda e: btn_new.configure(bg=SUCCESS_COLOR))
-
-    def render_profiles_list(self):
-        for widget in self.list_frame.winfo_children():
-            widget.destroy()
-
-        self.profile_buttons.clear()
-        
-        if not self.profiles:
-            lbl = tk.Label(self.list_frame, text="No hay perfiles guardados", font=("Arial", 10, "italic"), fg=TEXT_MUTED, bg=SIDEBAR_BG, pady=20)
-            lbl.pack()
-            return
-
-        for name in self.profiles.keys():
-            btn = tk.Button(self.list_frame, text=name, font=("Arial", 11), anchor="w",
-                            fg=TEXT_COLOR, bg=SIDEBAR_BG, activeforeground=TEXT_COLOR, activebackground=CARD_BG,
-                            bd=0, cursor="hand2", padx=15, pady=8, command=lambda n=name: self.select_profile(n))
-            btn.pack(fill=tk.X, pady=2)
-            self.profile_buttons[name] = btn
-            
-            # Hover effect
-            btn.bind("<Enter>", lambda e, b=btn: self.on_btn_enter(b))
-            btn.bind("<Leave>", lambda e, b=btn, n=name: self.on_btn_leave(b, n))
-
-    def on_btn_enter(self, btn):
-        if btn["background"] != CARD_BG:
-            btn.configure(bg=CARD_BG)
-
-    def on_btn_leave(self, btn, name):
-        if name != self.current_profile_name:
-            btn.configure(bg=SIDEBAR_BG)
-
-    def select_profile(self, name):
-        self.current_profile_name = name
-        for n, btn in self.profile_buttons.items():
-            if n == name:
-                btn.configure(bg=CARD_BG, font=("Arial", 11, "bold"))
-            else:
-                btn.configure(bg=SIDEBAR_BG, font=("Arial", 11))
-
-        data = self.profiles[name]
-        self.val_name.set(name)
-        self.val_host.set(data.get("host", ""))
-        self.val_port.set(data.get("port", "3389"))
-        self.val_user.set(data.get("user", ""))
-        self.val_pass.set(data.get("pass", ""))
-        self.val_domain.set(data.get("domain", ""))
-        self.val_multimon.set(data.get("multimon", True))
-        self.val_fullscreen.set(data.get("fullscreen", True))
-        self.val_audio.set(data.get("audio", True))
-        self.val_clipboard.set(data.get("clipboard", True))
-        self.val_ignore_cert.set(data.get("ignore_cert", True))
-        self.val_dyn_res.set(data.get("dyn_res", True))
-        self.val_microphone.set(data.get("microphone", False))
-        self.val_camera.set(data.get("camera", False))
-        
-        self.btn_delete.configure(state=tk.NORMAL, bg=ERROR_COLOR)
-
-    def new_profile(self):
-        self.current_profile_name = None
-        for btn in self.profile_buttons.values():
-            btn.configure(bg=SIDEBAR_BG, font=("Arial", 11))
-            
-        self.val_name.set("Nuevo Perfil")
-        self.val_host.set("")
-        self.val_port.set("3389")
-        self.val_user.set("")
-        self.val_pass.set("")
-        self.val_domain.set("")
-        self.val_multimon.set(True)
-        self.val_fullscreen.set(True)
-        self.val_audio.set(True)
-        self.val_clipboard.set(True)
-        self.val_ignore_cert.set(True)
-        self.val_dyn_res.set(True)
-        self.val_microphone.set(False)
-        self.val_camera.set(False)
-        
-        self.btn_delete.configure(state=tk.DISABLED, bg="#475569")
-
-    def setup_main_panel(self):
-        # Header
-        lbl_head = tk.Label(self.main_panel, text="Detalles de la Conexión", font=("Arial", 18, "bold"), fg=TEXT_COLOR, bg=BG_COLOR)
-        lbl_head.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 20))
-
-        # Variables
-        self.val_name = tk.StringVar()
-        self.val_host = tk.StringVar()
-        self.val_port = tk.StringVar(value="3389")
-        self.val_user = tk.StringVar()
-        self.val_pass = tk.StringVar()
-        self.val_domain = tk.StringVar()
-        self.val_multimon = tk.BooleanVar(value=True)
-        self.val_fullscreen = tk.BooleanVar(value=True)
-        self.val_audio = tk.BooleanVar(value=True)
-        self.val_clipboard = tk.BooleanVar(value=True)
-        self.val_ignore_cert = tk.BooleanVar(value=True)
-        self.val_dyn_res = tk.BooleanVar(value=True)
-        self.val_microphone = tk.BooleanVar(value=False)
-        self.val_camera = tk.BooleanVar(value=False)
-
-        # Form Helpers
-        def add_field(row, label_text, var, show_char=None):
-            lbl = tk.Label(self.main_panel, text=label_text, font=("Arial", 11), fg=TEXT_MUTED, bg=BG_COLOR)
-            lbl.grid(row=row, column=0, sticky="w", pady=6)
-            
-            entry = tk.Entry(self.main_panel, textvariable=var, font=("Arial", 11), fg=TEXT_COLOR, bg=SIDEBAR_BG,
-                             insertbackground=TEXT_COLOR, bd=0, highlightthickness=1, highlightcolor=ACCENT_COLOR,
-                             highlightbackground=CARD_BG, show=show_char)
-            entry.grid(row=row, column=1, columnspan=2, sticky="we", pady=6, ipady=4)
-            return entry
-
-        # Fields
-        add_field(1, "Nombre Perfil:", self.val_name)
-        
-        # Host and Port Row
-        lbl_host = tk.Label(self.main_panel, text="Host / IP:", font=("Arial", 11), fg=TEXT_MUTED, bg=BG_COLOR)
-        lbl_host.grid(row=2, column=0, sticky="w", pady=6)
-        
-        host_port_frame = tk.Frame(self.main_panel, bg=BG_COLOR)
-        host_port_frame.grid(row=2, column=1, columnspan=2, sticky="we", pady=6)
-        
-        entry_host = tk.Entry(host_port_frame, textvariable=self.val_host, font=("Arial", 11), fg=TEXT_COLOR, bg=SIDEBAR_BG,
-                              insertbackground=TEXT_COLOR, bd=0, highlightthickness=1, highlightcolor=ACCENT_COLOR,
-                              highlightbackground=CARD_BG)
-        entry_host.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
-        
-        lbl_port = tk.Label(host_port_frame, text=" Puerto:", font=("Arial", 11), fg=TEXT_MUTED, bg=BG_COLOR)
-        lbl_port.pack(side=tk.LEFT, padx=(5, 2))
-        
-        entry_port = tk.Entry(host_port_frame, textvariable=self.val_port, font=("Arial", 11), fg=TEXT_COLOR, bg=SIDEBAR_BG,
-                              insertbackground=TEXT_COLOR, bd=0, highlightthickness=1, highlightcolor=ACCENT_COLOR,
-                              highlightbackground=CARD_BG, width=6)
-        entry_port.pack(side=tk.LEFT, ipady=4)
-
-        add_field(3, "Usuario:", self.val_user)
-        
-        # Password field with toggle button
-        lbl_pass = tk.Label(self.main_panel, text="Contraseña:", font=("Arial", 11), fg=TEXT_MUTED, bg=BG_COLOR)
-        lbl_pass.grid(row=4, column=0, sticky="w", pady=6)
-        
-        self.entry_pass = tk.Entry(self.main_panel, textvariable=self.val_pass, font=("Arial", 11), fg=TEXT_COLOR, bg=SIDEBAR_BG,
-                                   insertbackground=TEXT_COLOR, bd=0, highlightthickness=1, highlightcolor=ACCENT_COLOR,
-                                   highlightbackground=CARD_BG, show="*")
-        self.entry_pass.grid(row=4, column=1, sticky="we", pady=6, ipady=4)
-        
-        self.btn_reveal = tk.Button(self.main_panel, text="Ver", font=("Arial", 9, "bold"), fg=TEXT_COLOR, bg=CARD_BG,
-                                    activeforeground=TEXT_COLOR, activebackground=SIDEBAR_BG, bd=0, cursor="hand2",
-                                    command=self.toggle_password_reveal, padx=8)
-        self.btn_reveal.grid(row=4, column=2, sticky="e", padx=(5, 0), pady=6, ipady=2)
-
-        add_field(5, "Dominio (Opt):", self.val_domain)
-
-        # Options
-        lbl_opts = tk.Label(self.main_panel, text="Opciones:", font=("Arial", 11), fg=TEXT_MUTED, bg=BG_COLOR)
-        lbl_opts.grid(row=6, column=0, sticky="nw", pady=(15, 6))
-
-        opts_frame = tk.Frame(self.main_panel, bg=BG_COLOR)
-        opts_frame.grid(row=6, column=1, columnspan=2, sticky="w", pady=(15, 6))
-
-        def add_check(parent, text, var):
-            cb = tk.Checkbutton(parent, text=text, variable=var, font=("Arial", 10), fg=TEXT_COLOR, bg=BG_COLOR,
-                                activeforeground=TEXT_COLOR, activebackground=BG_COLOR, selectcolor=BG_COLOR,
-                                bd=0, highlightthickness=0)
-            cb.pack(side=tk.LEFT, padx=(0, 15))
-
-        add_check(opts_frame, "Multi-Monitor", self.val_multimon)
-        add_check(opts_frame, "Pantalla Completa", self.val_fullscreen)
-        
-        opts_frame_2 = tk.Frame(self.main_panel, bg=BG_COLOR)
-        opts_frame_2.grid(row=7, column=1, columnspan=2, sticky="w", pady=(2, 10))
-        add_check(opts_frame_2, "Redirigir Audio", self.val_audio)
-        add_check(opts_frame_2, "Portapapeles", self.val_clipboard)
-
-        opts_frame_3 = tk.Frame(self.main_panel, bg=BG_COLOR)
-        opts_frame_3.grid(row=8, column=1, columnspan=2, sticky="w", pady=(2, 10))
-        add_check(opts_frame_3, "Ignorar Certificados", self.val_ignore_cert)
-        add_check(opts_frame_3, "Resolución Dinámica", self.val_dyn_res)
-
-        opts_frame_4 = tk.Frame(self.main_panel, bg=BG_COLOR)
-        opts_frame_4.grid(row=9, column=1, columnspan=2, sticky="w", pady=(2, 10))
-        add_check(opts_frame_4, "Redirigir Micrófono", self.val_microphone)
-        add_check(opts_frame_4, "Redirigir Cámara", self.val_camera)
-
-        # Actions Panel (Save, Delete, Install, Connect)
-        actions_frame = tk.Frame(self.main_panel, bg=BG_COLOR)
-        actions_frame.grid(row=10, column=0, columnspan=3, sticky="we", pady=(25, 0))
-
-        # Save Button
-        btn_save = tk.Button(actions_frame, text="Guardar", font=("Arial", 11, "bold"), fg=TEXT_COLOR, bg=SUCCESS_COLOR,
-                             activeforeground=TEXT_COLOR, activebackground=SUCCESS_HOVER, bd=0, cursor="hand2",
-                             command=self.save_current_profile, width=12, pady=8)
-        btn_save.pack(side=tk.LEFT, padx=(0, 10))
-        btn_save.bind("<Enter>", lambda e: btn_save.configure(bg=SUCCESS_HOVER))
-        btn_save.bind("<Leave>", lambda e: btn_save.configure(bg=SUCCESS_COLOR))
-
-        # Delete Button
-        self.btn_delete = tk.Button(actions_frame, text="Eliminar", font=("Arial", 11, "bold"), fg=TEXT_COLOR, bg=ERROR_COLOR,
-                                    activeforeground=TEXT_COLOR, activebackground=ERROR_HOVER, bd=0, cursor="hand2",
-                                    command=self.delete_current_profile, width=12, pady=8)
-        self.btn_delete.pack(side=tk.LEFT)
-        self.btn_delete.bind("<Enter>", lambda e: self.btn_delete.configure(bg=ERROR_HOVER) if self.current_profile_name else None)
-        self.btn_delete.bind("<Leave>", lambda e: self.btn_delete.configure(bg=ERROR_COLOR) if self.current_profile_name else None)
-
-        # Install Shortcut Button
-        btn_install = tk.Button(actions_frame, text="Crear Acceso", font=("Arial", 11, "bold"), fg=TEXT_COLOR, bg="#475569",
-                                activeforeground=TEXT_COLOR, activebackground="#334155", bd=0, cursor="hand2",
-                                command=self.install_desktop_shortcut, width=12, pady=8)
-        btn_install.pack(side=tk.LEFT, padx=10)
-        btn_install.bind("<Enter>", lambda e: btn_install.configure(bg="#334155"))
-        btn_install.bind("<Leave>", lambda e: btn_install.configure(bg="#475569"))
-
-        # BIG Connect Button
-        self.btn_connect = tk.Button(actions_frame, text="CONECTAR", font=("Arial", 12, "bold"), fg=TEXT_COLOR, bg=ACCENT_COLOR,
-                                activeforeground=TEXT_COLOR, activebackground=ACCENT_HOVER, bd=0, cursor="hand2",
-                                command=self.connect_rdp, padx=25, pady=8)
-        self.btn_connect.pack(side=tk.RIGHT)
-        self.btn_connect.bind("<Enter>", lambda e: self.btn_connect.configure(bg=ACCENT_HOVER) if self.btn_connect["state"] == tk.NORMAL else None)
-        self.btn_connect.bind("<Leave>", lambda e: self.btn_connect.configure(bg=ACCENT_COLOR) if self.btn_connect["state"] == tk.NORMAL else None)
-
-        self.lbl_status = tk.Label(actions_frame, text="", font=("Arial", 11, "bold"), fg=TEXT_MUTED, bg=BG_COLOR)
-        self.lbl_status.pack(side=tk.RIGHT, padx=15)
-
-        # Grid configuration
-        self.main_panel.columnconfigure(0, minsize=110)
-        self.main_panel.columnconfigure(1, weight=1)
-        self.main_panel.columnconfigure(2, minsize=60)
-
-    def toggle_password_reveal(self):
-        self.show_password = not self.show_password
-        if self.show_password:
-            self.entry_pass.configure(show="")
-            self.btn_reveal.configure(text="Ocultar")
-        else:
-            self.entry_pass.configure(show="*")
-            self.btn_reveal.configure(text="Ver")
-
-    def save_current_profile(self):
-        name = self.val_name.get().strip()
-        host = self.val_host.get().strip()
-        port = self.val_port.get().strip()
-        user = self.val_user.get().strip()
-        password = self.val_pass.get()
-        domain = self.val_domain.get().strip()
-        
+    def save_profile(self) -> bool:
+        name = self.entries["name"].get_text().strip()
+        data = self._form_data()
         if not name:
-            messagebox.showwarning("Advertencia", "Por favor ingresa un nombre para el perfil.")
-            return
-        if not host:
-            messagebox.showwarning("Advertencia", "Por favor ingresa la dirección IP o Host.")
-            return
+            self.toast("Ponle un nombre al perfil")
+            self.entries["name"].grab_focus()
+            return False
+        if not data["host"]:
+            self.toast("Falta el host o la IP")
+            self.entries["host"].grab_focus()
+            return False
+        if not data["port"].isdigit() or not 0 < int(data["port"]) < 65536:
+            self.toast("El puerto debe ser un número entre 1 y 65535")
+            self.entries["port"].grab_focus()
+            return False
+        if name != self.current and name in self.profiles:
+            self.toast(f"Ya existe un perfil llamado «{name}»")
+            self.entries["name"].grab_focus()
+            return False
 
-        # Build data dictionary
-        self.profiles[name] = {
-            "host": host,
-            "port": port,
-            "user": user,
-            "pass": password,
-            "domain": domain,
-            "multimon": self.val_multimon.get(),
-            "fullscreen": self.val_fullscreen.get(),
-            "audio": self.val_audio.get(),
-            "clipboard": self.val_clipboard.get(),
-            "ignore_cert": self.val_ignore_cert.get(),
-            "dyn_res": self.val_dyn_res.get(),
-            "microphone": self.val_microphone.get(),
-            "camera": self.val_camera.get()
-        }
-        
-        save_profiles(self.profiles)
-        self.render_profiles_list()
-        self.select_profile(name)
-        messagebox.showinfo("Éxito", f"Perfil '{name}' guardado correctamente.")
-
-    def delete_current_profile(self):
-        if not self.current_profile_name:
-            return
-        
-        name = self.current_profile_name
-        if messagebox.askyesno("Confirmar", f"¿Estás seguro de que deseas eliminar el perfil '{name}'?"):
-            del self.profiles[name]
+        if self.current and self.current != name:     # rename in place, keep the order
+            self.profiles = {(name if k == self.current else k): v
+                             for k, v in self.profiles.items()}
+        self.profiles[name] = data
+        try:
             save_profiles(self.profiles)
-            self.render_profiles_list()
+        except OSError as e:
+            self.toast(f"No se pudo guardar: {e}", timeout=6)
+            return False
+        self.current = name
+        self._render_list()
+        self.lookup_action("delete").set_enabled(True)
+        self.lookup_action("duplicate").set_enabled(True)
+        self._set_dirty(False)
+        self.toast(f"Perfil «{name}» guardado")
+        return True
+
+    def duplicate_profile(self) -> None:
+        if not self.current:
+            return
+        base = f"{self.current} (copia)"
+        name, n = base, 2
+        while name in self.profiles:
+            name, n = f"{base} {n}", n + 1
+        data = self._form_data()
+        self.current = None
+        self._reselect_current()
+        self._load_form(name, data)
+        self._set_dirty(True)
+        self.lookup_action("delete").set_enabled(False)
+        self.lookup_action("duplicate").set_enabled(False)
+        self.toast("Copia creada: guárdala para conservarla")
+
+    def confirm_delete(self) -> None:
+        if not self.current:
+            return
+        name = self.current
+        dialog = Adw.AlertDialog(heading="¿Eliminar el perfil?",
+                                 body=f"Se borrará «{name}» con su contraseña guardada.")
+        dialog.add_response("cancel", "Cancelar")
+        dialog.add_response("delete", "Eliminar")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+
+        def on_response(_d, response):
+            if response != "delete":
+                return
+            del self.profiles[name]
+            try:
+                save_profiles(self.profiles)
+            except OSError as e:
+                self.toast(f"No se pudo guardar: {e}", timeout=6)
+            self.current = None
+            self._render_list()
             if self.profiles:
-                self.select_profile(list(self.profiles.keys())[0])
+                self._select(next(iter(self.profiles)))
             else:
                 self.new_profile()
+            self.toast(f"Perfil «{name}» eliminado")
+        dialog.connect("response", on_response)
+        dialog.present(self)
 
-    def connect_rdp(self):
-        host = self.val_host.get().strip()
-        port = self.val_port.get().strip()
-        user = self.val_user.get().strip()
-        password = self.val_pass.get()
-        domain = self.val_domain.get().strip()
+    # ── Connect ──────────────────────────────────────────────────────────
+    def _set_status(self, text: str, css: str | None = None, busy: bool = False) -> None:
+        self.status.set_label(text)
+        for cls in ("status-ok", "status-error"):
+            self.status.remove_css_class(cls)
+        if css:
+            self.status.add_css_class(css)
+        self.spinner.set_visible(busy)
 
-        if not host:
-            messagebox.showwarning("Advertencia", "Por favor ingresa el Host/IP antes de conectar.")
+    def connect_rdp(self) -> None:
+        data = self._form_data()
+        if not data["host"]:
+            self.toast("Falta el host o la IP")
+            self.entries["host"].grab_focus()
+            return
+        binary = find_binary()
+        if not binary:
+            self.toast("No se encontró sdl-freerdp (compilado o del sistema)", timeout=6)
             return
 
-        # Find RDP binary
-        binary = DEFAULT_BINARY
-        if not os.path.exists(binary):
-            binary = FALLBACK_BINARY
-            if not os.path.exists(binary):
-                # Try path lookup
-                which_check = subprocess.run(["which", "sdl-freerdp3"], capture_output=True, text=True)
-                if which_check.returncode == 0:
-                    binary = which_check.stdout.strip()
-                else:
-                    messagebox.showerror("Error", "No se encontró el ejecutable sdl-freerdp (compilado o de sistema).")
-                    return
+        self.lookup_action("connect").set_enabled(False)
+        self._set_status("Preparando conexión…", busy=True)
+        excluded = self._effective_excluded()
+        used = [m.name for m in self.monitors if m.name not in excluded]
+        need_ids = data["multimon"] and bool(excluded & {m.name for m in self.monitors})
 
-        # Build command array
-        v_arg = f"/v:{host}"
-        if port and port != "3389":
-            v_arg = f"/v:{host}:{port}"
-            
-        cmd = [binary, v_arg]
-        if user:
-            cmd.append(f"/u:{user}")
-        if password:
-            cmd.append(f"/p:{password}")
-        if domain:
-            cmd.append(f"/d:{domain}")
-        if self.val_multimon.get():
+        def done(ids):
+            missing = [n for n in used if n not in ids]
+            if need_ids and missing:
+                self.toast(f"FreeRDP no ve {', '.join(missing)}; se conecta sin ese monitor",
+                           timeout=6)
+            monitor_ids = [ids[n] for n in used if n in ids] if need_ids else []
+            self._launch(binary, data, monitor_ids)
+
+        run_async(lambda: sdl_monitor_ids(binary) if need_ids else {}, done,
+                  lambda e: self._launch_failed(e))
+
+    def _build_command(self, binary: str, data: dict, monitor_ids: list[int]) -> list[str]:
+        host, port = data["host"], data["port"]
+        cmd = [binary, f"/v:{host}:{port}" if port and port != "3389" else f"/v:{host}"]
+        if data["user"]:
+            cmd.append(f"/u:{data['user']}")
+        if data["pass"]:
+            cmd.append(f"/p:{data['pass']}")
+        if data["domain"]:
+            cmd.append(f"/d:{data['domain']}")
+        if data["security"] != "auto":
+            cmd.append(f"/sec:{data['security']}")
+        if data["multimon"]:
             cmd.append("/multimon")
-        if self.val_fullscreen.get():
+            if monitor_ids:
+                cmd.append("/monitors:" + ",".join(str(i) for i in monitor_ids))
+        if data["fullscreen"]:
             cmd.append("/f")
-        if self.val_audio.get():
+        if data["audio"]:
             cmd.append("/sound")
-        if self.val_clipboard.get():
+        if data["clipboard"]:
             cmd.append("/clipboard")
-        if self.val_ignore_cert.get():
+        if data["ignore_cert"]:
             cmd.append("/cert:ignore")
-        if self.val_dyn_res.get():
+        if data["dyn_res"]:
             cmd.append("/dynamic-resolution")
-        if self.val_microphone.get():
+        cmd.append("/auto-reconnect")
+        if data["microphone"]:
             cmd.append("/microphone:sys:alsa")
-        if self.val_camera.get():
+        if data["camera"]:
             cmd.append("/dvc:rdpecam")
-        if self.val_audio.get() or self.val_microphone.get() or self.val_camera.get():
+        if data["gfx"]:
+            cmd.append("/gfx:AVC444")
+        if data["audio"] or data["microphone"] or data["camera"]:
             cmd.append("/log-filters:com.freerdp.channels.rdpsnd:DEBUG,"
                        "com.freerdp.channels.audin:DEBUG,"
                        "com.freerdp.channels.rdpecam:DEBUG,"
                        "com.freerdp.channels.drdynvc:DEBUG")
+        return cmd
 
-        # Launch asynchronously so GUI doesn't hang
+    def _launch(self, binary: str, data: dict, monitor_ids: list[int]) -> None:
+        cmd = self._build_command(binary, data, monitor_ids)
+        env = os.environ.copy()
+        local_lib = str(Path.home() / ".local/lib")
+        env["LD_LIBRARY_PATH"] = (f"{local_lib}:{env['LD_LIBRARY_PATH']}"
+                                  if env.get("LD_LIBRARY_PATH") else local_lib)
         try:
-            self.lbl_status.configure(text="Conectando...", fg=ACCENT_COLOR)
-            self.btn_connect.configure(state=tk.DISABLED, bg="#475569")
-            
-            log_dir = os.path.expanduser("~/.config/freerdp")
-            if not os.path.exists(log_dir):
-                os.makedirs(log_dir)
-            log_path = os.path.join(log_dir, "last_connection.log")
-            log_file = open(log_path, "w")
-            
-            env = os.environ.copy()
-            local_lib = os.path.expanduser("~/.local/lib")
-            if "LD_LIBRARY_PATH" in env:
-                env["LD_LIBRARY_PATH"] = f"{local_lib}:{env['LD_LIBRARY_PATH']}"
-            else:
-                env["LD_LIBRARY_PATH"] = local_lib
-                
-            proc = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=log_file)
-            
-            # Monitor process for a few seconds to detect failure
-            self.root.after(100, lambda: self.monitor_process(proc, log_path, log_file, 0))
-        except Exception as e:
-            self.lbl_status.configure(text="Error de ejecución", fg=ERROR_COLOR)
-            self.btn_connect.configure(state=tk.NORMAL, bg=ACCENT_COLOR)
-            messagebox.showerror("Error de Ejecución", f"Fallo al ejecutar RDP: {e}")
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            log = open(LOG_FILE, "w")
+            proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=log)
+        except OSError as e:
+            self._launch_failed(e)
+            return
+        self._set_status(f"Conectando a {data['host']}…", busy=True)
+        self._watch(proc, log, 0)
 
-    def monitor_process(self, proc, log_path, log_file, elapsed_ms):
+    def _launch_failed(self, error) -> None:
+        self.lookup_action("connect").set_enabled(True)
+        self._set_status("Error al ejecutar FreeRDP", "status-error")
+        self.toast(f"No se pudo ejecutar FreeRDP: {error}", timeout=6)
+
+    def _watch(self, proc, log, elapsed_ms: int) -> None:
+        """Keep polling while the client lives so a late failure is still reported."""
         ret = proc.poll()
         if ret is not None:
-            # Process exited, close log file
-            try:
-                log_file.close()
-            except Exception:
-                pass
-                
-            self.btn_connect.configure(state=tk.NORMAL, bg=ACCENT_COLOR)
-            
+            log.close()
+            self.lookup_action("connect").set_enabled(True)
             if ret != 0:
-                self.lbl_status.configure(text="Error de conexión", fg=ERROR_COLOR)
-                # An error occurred. Show error window.
-                try:
-                    with open(log_path, "r") as f:
-                        log_content = f.read().strip()
-                except Exception:
-                    log_content = "No se pudo leer el archivo de log."
-                self.show_error_window(ret, log_content)
+                self._set_status("La conexión falló", "status-error")
+                self.show_log(failed_code=ret)
             else:
-                self.lbl_status.configure(text="Conexión finalizada", fg=TEXT_MUTED)
-                self.root.after(3000, lambda: self.lbl_status.configure(text=""))
+                self._set_status("Sesión finalizada")
             return
-            
-        if elapsed_ms < 3000:
-            self.root.after(200, lambda: self.monitor_process(proc, log_path, log_file, elapsed_ms + 200))
-        else:
-            # We monitored for 3 seconds, assume it started successfully. Close file descriptor.
-            try:
-                log_file.close()
-            except Exception:
-                pass
-            self.lbl_status.configure(text="Conexión iniciada", fg=SUCCESS_COLOR)
-            self.btn_connect.configure(state=tk.NORMAL, bg=ACCENT_COLOR)
-            self.root.after(5000, lambda: self.lbl_status.configure(text=""))
+        if elapsed_ms == STARTUP_GRACE_MS:
+            self._set_status("Sesión iniciada", "status-ok")
+            self.lookup_action("connect").set_enabled(True)
+        step = 200 if elapsed_ms < STARTUP_GRACE_MS else 1000
+        GLib.timeout_add(step, lambda: (self._watch(proc, log, elapsed_ms + step),
+                                        GLib.SOURCE_REMOVE)[1])
 
-    def show_error_window(self, exit_code, log_content):
-        err_win = tk.Toplevel(self.root)
-        err_win.title("Error de Conexión RDP")
-        err_win.geometry("600x400")
-        err_win.configure(bg=BG_COLOR)
-        err_win.transient(self.root)
-        err_win.grab_set()
-        
-        lbl = tk.Label(err_win, text=f"La conexión falló (Código de salida: {exit_code})", font=("Arial", 12, "bold"), fg=ERROR_COLOR, bg=BG_COLOR, pady=10)
-        lbl.pack()
-        
-        txt_frame = tk.Frame(err_win, bg=BG_COLOR, padx=10, pady=10)
-        txt_frame.pack(fill=tk.BOTH, expand=True)
-        
-        scrollbar = tk.Scrollbar(txt_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        txt = tk.Text(txt_frame, font=("Courier", 10), fg=TEXT_COLOR, bg=SIDEBAR_BG, wrap=tk.WORD, yscrollcommand=scrollbar.set, bd=0)
-        txt.pack(fill=tk.BOTH, expand=True)
-        scrollbar.config(command=txt.yview)
-        
-        txt.insert(tk.END, log_content)
-        txt.config(state=tk.DISABLED)
-        
-        btn_close = tk.Button(err_win, text="Cerrar", font=("Arial", 10, "bold"), fg=TEXT_COLOR, bg=CARD_BG, bd=0, cursor="hand2", command=err_win.destroy, pady=6, width=10)
-        btn_close.pack(pady=10)
-
-    def install_desktop_shortcut(self):
-        shortcut_path = os.path.expanduser("~/.local/share/applications/freerdp-launcher.desktop")
-        bin_dir = os.path.expanduser("~/.local/bin")
-        bin_path = os.path.join(bin_dir, "rdp-launcher")
-        
+    # ── Log / shortcut ───────────────────────────────────────────────────
+    def show_log(self, failed_code: int | None = None) -> None:
         try:
-            # Ensure directories exist
-            os.makedirs(bin_dir, exist_ok=True)
-            os.makedirs(os.path.dirname(shortcut_path), exist_ok=True)
-            
-            # Copy current script to ~/.local/bin/rdp-launcher
-            import shutil
-            current_script = os.path.abspath(sys.argv[0])
-            shutil.copy2(current_script, bin_path)
-            os.chmod(bin_path, 0o755)
-            
-            # Write desktop file
-            desktop_content = f"""[Desktop Entry]
-Name=sdl-freerdp3
-Comment=FreeRDP SDL3 Remote Desktop Client (Custom Multimonitor Build)
-Exec={bin_path}
-Icon=preferences-desktop-remote
-Terminal=false
-Type=Application
-Categories=Network;RemoteAccess;
-StartupNotify=true
-"""
-            with open(shortcut_path, "w") as f:
-                f.write(desktop_content)
-                
-            messagebox.showinfo("Éxito", "Acceso directo y binario del lanzador creados/reparados con éxito en su sistema.")
-        except Exception as e:
-            messagebox.showerror("Error", f"No se pudo instalar el acceso directo: {e}")
+            text = LOG_FILE.read_text(errors="replace").strip()
+        except OSError:
+            text = ""
+        if failed_code is None:
+            heading, body = "Última conexión", str(LOG_FILE)
+        else:
+            heading = "La conexión falló"
+            body = summarize_error(text) or f"sdl-freerdp terminó con código {failed_code}."
+
+        view = Gtk.TextView(editable=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                            css_classes=["log-view"], cursor_visible=False)
+        view.get_buffer().set_text(text or "(sin registro)")
+        scroller = Gtk.ScrolledWindow(child=view, min_content_height=320,
+                                      min_content_width=640, vexpand=True)
+        GLib.idle_add(lambda: (scroller.get_vadjustment().set_value(
+            scroller.get_vadjustment().get_upper()), GLib.SOURCE_REMOVE)[1])
+
+        dialog = Adw.AlertDialog(heading=heading, body=body, extra_child=scroller,
+                                 prefer_wide_layout=True)
+        dialog.add_response("copy", "Copiar")
+        dialog.add_response("close", "Cerrar")
+        dialog.set_default_response("close")
+        dialog.set_close_response("close")
+
+        def on_response(_d, response):
+            if response == "copy":
+                self.get_clipboard().set(text)
+                self.toast("Log copiado al portapapeles")
+        dialog.connect("response", on_response)
+        dialog.present(self)
+
+    def install_shortcut(self) -> None:
+        script = Path(__file__).resolve()
+        try:
+            BIN_LINK.parent.mkdir(parents=True, exist_ok=True)
+            if BIN_LINK.is_symlink() or BIN_LINK.exists():
+                if BIN_LINK.resolve() != script:
+                    BIN_LINK.unlink()
+            if not BIN_LINK.exists():
+                BIN_LINK.symlink_to(script)
+            DESKTOP_FILE.parent.mkdir(parents=True, exist_ok=True)
+            DESKTOP_FILE.write_text(
+                "[Desktop Entry]\n"
+                "Name=FreeRDP\n"
+                "Comment=FreeRDP SDL3 Remote Desktop Client (Custom Multimonitor Build)\n"
+                f"Exec={BIN_LINK}\n"
+                "Icon=preferences-desktop-remote\n"
+                "Terminal=false\n"
+                "Type=Application\n"
+                "Categories=Network;RemoteAccess;\n"
+                "StartupNotify=true\n"
+                f"StartupWMClass={APP_ID}\n")
+        except OSError as e:
+            self.toast(f"No se pudo crear el acceso: {e}", timeout=6)
+            return
+        self.toast("Acceso creado en el menú de aplicaciones")
+
+
+# ── Application ──────────────────────────────────────────────────────────
+ACCELS = {
+    "win.connect": ["<Ctrl>Return"],
+    "win.save": ["<Ctrl>s"],
+    "win.new-profile": ["<Ctrl>n"],
+    "win.duplicate": ["<Ctrl><Shift>d"],
+    "win.refresh-monitors": ["F5"],
+    "win.show-log": ["<Ctrl>l"],
+    "app.shortcuts": ["<Ctrl>question"],
+    "app.quit": ["<Ctrl>q"],
+}
+
+SHORTCUTS = [
+    ("Conexión", [("Conectar", "<Ctrl>Return"), ("Ver log de la última conexión", "<Ctrl>l"),
+                  ("Volver a detectar monitores", "F5")]),
+    ("Perfiles", [("Nuevo perfil", "<Ctrl>n"), ("Guardar", "<Ctrl>s"),
+                  ("Duplicar", "<Ctrl><Shift>d")]),
+    ("General", [("Atajos de teclado", "<Ctrl>question"), ("Salir", "<Ctrl>q")]),
+]
+
+
+class LauncherApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        self._theme_provider = Gtk.CssProvider()
+        self._theme_sig = None
+        self.window: LauncherWindow | None = None
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        display = Gdk.Display.get_default()
+        style = Gtk.CssProvider()
+        style.load_from_string(STYLE)
+        Gtk.StyleContext.add_provider_for_display(
+            display, style, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        Gtk.StyleContext.add_provider_for_display(
+            display, self._theme_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+        self._reload_theme()
+        GLib.timeout_add_seconds(THEME_POLL_SECONDS, self._poll_theme)
+
+        for name, callback in (("shortcuts", self._shortcuts), ("about", self._about),
+                               ("quit", self.quit)):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda *_a, cb=callback: cb())
+            self.add_action(action)
+        for action, accels in ACCELS.items():
+            self.set_accels_for_action(action, accels)
+
+    def do_activate(self):
+        if self.window is None:
+            self.window = LauncherWindow(self)
+            self.window.layout.set_colors(load_colors())
+        self.window.present()
+
+    def _reload_theme(self):
+        colors = load_colors()
+        self._theme_sig = theme_signature()
+        self._theme_provider.load_from_string(theme_css(colors))
+        Adw.StyleManager.get_default().set_color_scheme(
+            Adw.ColorScheme.FORCE_DARK if is_dark(colors) else Adw.ColorScheme.FORCE_LIGHT)
+        if self.window:
+            self.window.layout.set_colors(colors)
+
+    def _poll_theme(self):
+        # Omarchy rewrites current/theme in place on `omarchy theme set`
+        if theme_signature() != self._theme_sig:
+            self._reload_theme()
+            if self.window:
+                self.window.toast("Tema de Omarchy actualizado")
+        return GLib.SOURCE_CONTINUE
+
+    def _shortcuts(self):
+        dialog = Adw.ShortcutsDialog()
+        for title, items in SHORTCUTS:
+            section = Adw.ShortcutsSection.new(title)
+            for label, accel in items:
+                section.add(Adw.ShortcutsItem.new(label, accel))
+            dialog.add(section)
+        dialog.present(self.window)
+
+    def _about(self):
+        Adw.AboutDialog(
+            application_name="FreeRDP Launcher",
+            application_icon="preferences-desktop-remote",
+            version=VERSION,
+            comments="Perfiles y selección de monitores para el cliente sdl-freerdp "
+                     "compilado con los arreglos multimonitor para Wayland.",
+            license_type=Gtk.License.APACHE_2_0,
+        ).present(self.window)
+
+
+def main() -> int:
+    return LauncherApp().run(sys.argv)
+
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = RDPLauncherApp(root)
-    root.mainloop()
+    sys.exit(main())
