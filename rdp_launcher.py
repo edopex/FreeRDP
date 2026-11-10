@@ -989,10 +989,15 @@ class LauncherWindow(Adw.ApplicationWindow):
         if data["gfx"]:
             cmd.append("/gfx:AVC444")
         if data["audio"] or data["microphone"] or data["camera"]:
-            cmd.append("/log-filters:com.freerdp.channels.rdpsnd:DEBUG,"
-                       "com.freerdp.channels.audin:DEBUG,"
-                       "com.freerdp.channels.rdpecam:DEBUG,"
-                       "com.freerdp.channels.drdynvc:DEBUG")
+            # WLog matches tags component by component; "*" covers the trailing ".client" etc.
+            cmd.append("/log-filters:com.freerdp.channels.rdpsnd.*:DEBUG,"
+                       "com.freerdp.channels.audin.*:DEBUG,"
+                       "com.freerdp.channels.rdpecam.*:DEBUG,"
+                       "com.freerdp.channels.rdpecam-enum.*:DEBUG,"
+                       "com.freerdp.channels.rdpecam-device.*:DEBUG,"
+                       "com.freerdp.channels.rdpecam-v4l.*:DEBUG,"
+                       "com.freerdp.channels.rdpecam-video.*:DEBUG,"
+                       "com.freerdp.channels.drdynvc.*:DEBUG")
         return cmd
 
     def _launch(self, binary: str, data: dict, monitor_ids: list[int]) -> None:
