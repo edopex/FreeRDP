@@ -70,6 +70,11 @@ BOOL wlf_handle_pointer_enter(freerdp* instance, const UwacPointerEnterLeaveEven
 	if (!wlf_scale_coordinates(instance->context, &x, &y, TRUE))
 		return FALSE;
 
+	if ((int32_t)x < 0)
+		x = 0;
+	if ((int32_t)y < 0)
+		y = 0;
+
 	cctx = (rdpClientContext*)instance->context;
 	return freerdp_client_send_button_event(cctx, FALSE, PTR_FLAGS_MOVE,
 	                                        WINPR_ASSERTING_INT_CAST(int, x),
@@ -91,6 +96,11 @@ BOOL wlf_handle_pointer_motion(freerdp* instance, const UwacPointerMotionEvent* 
 
 	if (!wlf_scale_coordinates(instance->context, &x, &y, TRUE))
 		return FALSE;
+
+	if ((int32_t)x < 0)
+		x = 0;
+	if ((int32_t)y < 0)
+		y = 0;
 
 	return freerdp_client_send_button_event(cctx, FALSE, PTR_FLAGS_MOVE,
 	                                        WINPR_ASSERTING_INT_CAST(int32_t, x),
@@ -114,6 +124,11 @@ BOOL wlf_handle_pointer_buttons(freerdp* instance, const UwacPointerButtonEvent*
 
 	if (!wlf_scale_coordinates(instance->context, &x, &y, TRUE))
 		return FALSE;
+
+	if ((int32_t)x < 0)
+		x = 0;
+	if ((int32_t)y < 0)
+		y = 0;
 
 	if (ev->state == WL_POINTER_BUTTON_STATE_PRESSED)
 	{
