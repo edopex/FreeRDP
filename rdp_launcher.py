@@ -994,10 +994,11 @@ class LauncherWindow(Adw.ApplicationWindow):
             if data["gpu"]:
                 cmd.append("/gdi:hw")
                 filters.append("com.freerdp.codec:DEBUG")
-        if data["audio"] or data["microphone"] or data["camera"]:
+        if data["microphone"] or data["camera"]:
             # WLog matches tags component by component; "*" covers the trailing ".client" etc.
+            # rdpsnd is left out: it logs two lines per audio block (~400 KB in minutes).
             filters += [f"com.freerdp.channels.{tag}.*:DEBUG" for tag in (
-                "rdpsnd", "audin", "rdpecam", "rdpecam-enum", "rdpecam-device",
+                "audin", "rdpecam", "rdpecam-enum", "rdpecam-device",
                 "rdpecam-v4l", "rdpecam-video", "drdynvc")]
         if filters:
             cmd.append("/log-filters:" + ",".join(filters))
