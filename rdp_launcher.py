@@ -49,7 +49,7 @@ DEFAULTS = {
     "host": "", "port": "3389", "user": "", "pass": "", "domain": "",
     "multimon": True, "fullscreen": True, "dyn_res": True,
     "audio": True, "microphone": False, "camera": False, "clipboard": True,
-    "gfx": False, "ignore_cert": True, "security": "auto",
+    "gfx": False, "gpu": True, "ignore_cert": True, "security": "auto",
     # Output names (e.g. "HDMI-A-1") left out of /multimon. None = default:
     # the HDMI TV, which stays "enabled" with DPMS off, so FreeRDP sees it.
     "excluded_monitors": None,
@@ -630,6 +630,8 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.security.connect("notify::selected", self._changed)
         group.add(self.security)
         self._switch(group, "gfx", "Gráficos GFX (H.264 AVC444)")
+        self._switch(group, "gpu", "Aceleración por GPU",
+                     "Decodifica el H.264 con VAAPI en la tarjeta gráfica (requiere GFX)")
         self._switch(group, "ignore_cert", "Ignorar certificados")
         return group
 
@@ -986,18 +988,19 @@ class LauncherWindow(Adw.ApplicationWindow):
             cmd.append("/microphone:sys:alsa")
         if data["camera"]:
             cmd.append("/dvc:rdpecam")
+        filters = []
         if data["gfx"]:
             cmd.append("/gfx:AVC444")
+            if data["gpu"]:
+                cmd.append("/gdi:hw")
+                filters.append("com.freerdp.codec:DEBUG")
         if data["audio"] or data["microphone"] or data["camera"]:
             # WLog matches tags component by component; "*" covers the trailing ".client" etc.
-            cmd.append("/log-filters:com.freerdp.channels.rdpsnd.*:DEBUG,"
-                       "com.freerdp.channels.audin.*:DEBUG,"
-                       "com.freerdp.channels.rdpecam.*:DEBUG,"
-                       "com.freerdp.channels.rdpecam-enum.*:DEBUG,"
-                       "com.freerdp.channels.rdpecam-device.*:DEBUG,"
-                       "com.freerdp.channels.rdpecam-v4l.*:DEBUG,"
-                       "com.freerdp.channels.rdpecam-video.*:DEBUG,"
-                       "com.freerdp.channels.drdynvc.*:DEBUG")
+            filters += [f"com.freerdp.channels.{tag}.*:DEBUG" for tag in (
+                "rdpsnd", "audin", "rdpecam", "rdpecam-enum", "rdpecam-device",
+                "rdpecam-v4l", "rdpecam-video", "drdynvc")]
+        if filters:
+            cmd.append("/log-filters:" + ",".join(filters))
         return cmd
 
     def _launch(self, binary: str, data: dict, monitor_ids: list[int]) -> None:
